@@ -1,0 +1,647 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no" />
+  <title>Дом - WebXR</title>
+  <style>
+    html, body { margin: 0; height: 100%; overflow: hidden; background: #05080d; color: #e8eef4; font-family: system-ui, sans-serif; }
+    #ui { position: fixed; left: 12px; top: 12px; z-index: 10; font-size: 14px;
+          background: rgba(0,0,0,.45); padding: 10px 14px; border-radius: 8px; max-width: 340px; }
+    #ui b { color: #7fd7ff; }
+    #ui .row { margin-top: 6px; }
+    button { font: inherit; padding: 4px 10px; margin-right: 6px; border-radius: 6px; border: 1px solid #4a6478;
+             background: #14202c; color: #dfe9f0; cursor: pointer; }
+    button:hover { background: #1d2d3d; }
+    input[type=range] { vertical-align: middle; width: 180px; }
+    #status { color: #9fe0a0; }
+    .err { color: #ff9a9a; }
+  </style>
+</head>
+<body>
+  <div id="ui">
+    <div><b>Дом - WebXR</b></div>
+    <div class="row">
+      <button id="btnMode">Вид: обзор</button>
+      <button id="btnPlay">Время: авто</button>
+      <button id="btnReset">Сброс</button>
+    </div>
+    <div class="row">
+      Время: <input type="range" id="timeSlider" min="0" max="24" step="0.1" value="10" />
+      <span id="clock">10:00</span>
+    </div>
+    <div class="row">Левый стик - ходить, правый стик (влево/вправо) - поворот.<br />
+      Кнопки: A - вид, B - авто-время, Y - сброс.</div>
+    <div id="status">Наденьте шлем и нажмите ENTER VR.</div>
+  </div>
+
+  <script>
+    window.addEventListener('error', (e) => {
+      const s = document.getElementById('status');
+      s.className = 'err';
+      s.textContent = 'Ошибка: ' + (e.message || e.error);
+    });
+    window.addEventListener('unhandledrejection', (e) => {
+      const s = document.getElementById('status');
+      s.className = 'err';
+      const m = e.reason && e.reason.message ? e.reason.message : e.reason;
+      s.textContent = 'Ошибка: ' + m;
+    });
+  </script>
+
+  <script type="importmap">
+  {
+    "imports": { "three": "./lib/three.module.js" }
+  }
+  </script>
+
+  <script type="module">
+  import * as THREE from 'three';
+  import { VRButton } from './lib/VRButton.js';
+
+  // ---------------------------------------------------------------- renderer
+  const renderer = new THREE.WebGLRenderer({ antialias: true });
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  renderer.xr.enabled = true;
+  renderer.xr.setReferenceSpaceType('local-floor');
+  renderer.outputColorSpace = THREE.SRGBColorSpace;
+  renderer.shadowMap.enabled = false;
+  document.body.appendChild(renderer.domElement);
+  const vrButton = VRButton.createButton(renderer);
+  vrButton.style.padding = '12px 18px';
+  document.body.appendChild(vrButton);
+
+  const scene = new THREE.Scene();
+  const camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.05, 300);
+  camera.rotation.order = 'YXZ';
+
+  // Everything lives in `world`; locomotion transforms `world` (inverse player).
+  const world = new THREE.Group();
+  world.matrixAutoUpdate = false;
+  scene.add(world);
+
+  // ---------------------------------------------------------------- material cache
+  const matCache = new Map();
+  function mat(color, rough = 0.85, metal = 0.0, flat = true) {
+    const key = color + '_' + rough + '_' + metal + '_' + flat;
+    if (!matCache.has(key)) {
+      matCache.set(key, new THREE.MeshStandardMaterial({ color, roughness: rough, metalness: metal, flatShading: flat }));
+    }
+    return matCache.get(key);
+  }
+
+  function box(parent, w, h, d, color, x, yBottom, z, rotY = 0, opts = {}) {
+    const m = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), opts.material || mat(color, opts.rough, opts.metal, opts.flat));
+    m.position.set(x, yBottom + h / 2, z);
+    m.rotation.y = rotY;
+    if (opts.shadow) m.castShadow = true;
+    parent.add(m);
+    return m;
+  }
+
+  function cyl(parent, rTop, rBot, h, color, x, yBottom, z, opts = {}) {
+    const m = new THREE.Mesh(new THREE.CylinderGeometry(rTop, rBot, h, opts.seg || 14),
+      opts.material || mat(color, opts.rough, opts.metal, opts.flat));
+    m.position.set(x, yBottom + h / 2, z);
+    parent.add(m);
+    return m;
+  }
+
+  // ---------------------------------------------------------------- house shell
+  const houseRoot = new THREE.Group();
+  world.add(houseRoot);
+
+  const WALL_H = 2.6, WALL_T = 0.16;
+  const wallBoxes = [];
+
+  // --- procedural wall textures ---
+  function makeBrickTexture() {
+    const c = document.createElement('canvas');
+    c.width = 256; c.height = 256;
+    const g = c.getContext('2d');
+    g.fillStyle = '#b7a394'; g.fillRect(0, 0, 256, 256);
+    const bh = 32, bw = 64, m = 5;
+    for (let row = 0; row * bh < 256; row++) {
+      const y = row * bh;
+      const off = (row % 2) ? -bw / 2 : 0;
+      for (let x = -bw; x < 256 + bw; x += bw) {
+        const s = 0.85 + Math.random() * 0.3;
+        g.fillStyle = 'rgb(' + Math.round(150 * s) + ',' + Math.round(72 * s) + ',' + Math.round(60 * s) + ')';
+        g.fillRect(x + off + m / 2, y + m / 2, bw - m, bh - m);
+      }
+    }
+    const t = new THREE.CanvasTexture(c);
+    t.wrapS = t.wrapT = THREE.RepeatWrapping;
+    t.colorSpace = THREE.SRGBColorSpace;
+    return t;
+  }
+
+  function makePaperTexture() {
+    const c = document.createElement('canvas');
+    c.width = 128; c.height = 128;
+    const g = c.getContext('2d');
+    g.fillStyle = '#f0e7d6'; g.fillRect(0, 0, 128, 128);
+    g.fillStyle = '#e2d4ba';
+    for (let x = 0; x < 128; x += 16) g.fillRect(x, 0, 6, 128);
+    g.fillStyle = '#d7c5a3';
+    for (let y = 8; y < 128; y += 24) {
+      for (let x = 8; x < 128; x += 16) {
+        g.beginPath(); g.arc(x, y, 2.2, 0, Math.PI * 2); g.fill();
+      }
+    }
+    const t = new THREE.CanvasTexture(c);
+    t.wrapS = t.wrapT = THREE.RepeatWrapping;
+    t.colorSpace = THREE.SRGBColorSpace;
+    return t;
+  }
+
+  const brickTex = makeBrickTexture();
+  const paperTex = makePaperTexture();
+  const trimMat = mat(0xece5da, 0.9);
+
+  function faceMat(base, w, h, scale) {
+    const t = base.clone();
+    t.needsUpdate = true;
+    t.wrapS = t.wrapT = THREE.RepeatWrapping;
+    t.repeat.set(Math.max(1, w / scale), Math.max(1, h / scale));
+    return new THREE.MeshStandardMaterial({ map: t, roughness: 0.9 });
+  }
+
+  // extSide: 1 = +axis face is exterior, -1 = -axis face is exterior, 0 = interior both sides
+  function wallMats(faceW, extSide, alongZ) {
+    const brick = () => faceMat(brickTex, faceW, WALL_H, 1.2);
+    const paper = () => faceMat(paperTex, faceW, WALL_H, 1.6);
+    if (alongZ) {
+      return [trimMat, trimMat, trimMat, trimMat,
+        (extSide === 1) ? brick() : paper(),
+        (extSide === -1) ? brick() : paper()];
+    }
+    return [(extSide === 1) ? brick() : paper(),
+      (extSide === -1) ? brick() : paper(),
+      trimMat, trimMat, trimMat, trimMat];
+  }
+
+  function wallZ(z, x1, x2, extSide = 0) {
+    const xx1 = Math.min(x1, x2), xx2 = Math.max(x1, x2);
+    const w = xx2 - xx1;
+    const mesh = new THREE.Mesh(new THREE.BoxGeometry(w, WALL_H, WALL_T), wallMats(w, extSide, true));
+    mesh.position.set((xx1 + xx2) / 2, WALL_H / 2, z);
+    houseRoot.add(mesh);
+    wallBoxes.push({ minX: xx1, maxX: xx2, minZ: z - WALL_T / 2, maxZ: z + WALL_T / 2 });
+  }
+  function wallX(x, z1, z2, extSide = 0) {
+    const zz1 = Math.min(z1, z2), zz2 = Math.max(z1, z2);
+    const d = zz2 - zz1;
+    const mesh = new THREE.Mesh(new THREE.BoxGeometry(WALL_T, WALL_H, d), wallMats(d, extSide, false));
+    mesh.position.set(x, WALL_H / 2, (zz1 + zz2) / 2);
+    houseRoot.add(mesh);
+    wallBoxes.push({ minX: x - WALL_T / 2, maxX: x + WALL_T / 2, minZ: zz1, maxZ: zz2 });
+  }
+
+  // outer walls (exterior = brick, interior = wallpaper)
+  wallZ(4, -5, -0.8, 1);      // south, living side
+  wallZ(4, 0.2, 5, 1);        // south, bedroom side (entrance gap -0.8..0.2)
+  wallZ(-4, -5, 2, -1);       // north, living+kitchen
+  wallZ(-4, 3.2, 5, -1);      // north, kitchen (window gap 2..3.2)
+  wallX(-5, -4, -0.6, -1);    // west
+  wallX(-5, 0.6, 4, -1);
+  wallX(5, -4, 1.5, 1);       // east
+  wallX(5, 2.7, 4, 1);
+  // interior walls (wallpaper both sides)
+  wallX(1, -4, -2.6);
+  wallX(1, -1.4, 1.4);
+  wallX(1, 2.6, 4);
+  wallZ(0, 1, 2.6);
+  wallZ(0, 3.8, 5);
+
+  // base slab + room floors
+  box(houseRoot, 10.3, 0.2, 8.3, 0x6b6157, 0, -0.2, 0);
+  box(houseRoot, 6.0, 0.03, 8.0, 0xb98a5a, -2.0, 0.0, 0);      // living (wood)
+  box(houseRoot, 4.0, 0.03, 4.0, 0xcfd4d8, 3.0, 0.0, -2.0);    // kitchen (tile)
+  box(houseRoot, 4.0, 0.03, 4.0, 0x8a7f74, 3.0, 0.0, 2.0);     // bedroom (carpet)
+
+  // ---------------------------------------------------------------- kitchen
+  const K = 0.02;
+  // counter along the north wall
+  box(houseRoot, 3.2, 0.85, 0.6, 0xe8e2d8, 3.2, 0, -3.55);
+  box(houseRoot, 3.3, 0.06, 0.66, 0x3a3f45, 3.2, 0.85, -3.55);
+  // sink + faucet
+  box(houseRoot, 0.55, 0.05, 0.42, 0x9aa4ad, 3.9, 0.885, -3.55, 0, { metal: 0.6, rough: 0.3 });
+  cyl(houseRoot, 0.025, 0.025, 0.3, 0xb9c2c9, 3.9, 0.9, -3.78, { metal: 0.7, rough: 0.25 });
+  // stove/oven
+  box(houseRoot, 0.7, 0.85, 0.6, 0xd8dde2, 1.75, 0, -3.55, 0, { metal: 0.3, rough: 0.5 });
+  box(houseRoot, 0.62, 0.35, 0.03, 0x2b3138, 1.75, 0.25, -3.24, 0, { metal: 0.5, rough: 0.2 });
+  for (const [bx, bz] of [[-0.16, -0.14], [0.16, -0.14], [-0.16, 0.14], [0.16, 0.14]]) {
+    cyl(houseRoot, 0.09, 0.09, 0.02, 0x181c20, 1.75 + bx, 0.855, -3.55 + bz, { flat: true });
+  }
+  // upper cabinets
+  box(houseRoot, 3.2, 0.7, 0.35, 0xefe9df, 3.2, 1.55, -3.78);
+  // fridge
+  box(houseRoot, 0.75, 1.85, 0.7, 0xdfe4e9, 4.6, 0, -3.5, 0, { metal: 0.4, rough: 0.35 });
+  box(houseRoot, 0.03, 0.9, 0.72, 0x9aa4ad, 4.6, 0.92, -3.5, 0, { metal: 0.6, rough: 0.3 });
+  cyl(houseRoot, 0.02, 0.02, 0.5, 0x6f777e, 4.24, 0.95, -3.5);
+  // table + chairs
+  box(houseRoot, 1.7, 0.08, 1.0, 0xb07b4a, 3.0, 0.72, -1.9);
+  for (const [lx, lz] of [[-0.75, -0.42], [0.75, -0.42], [-0.75, 0.42], [0.75, 0.42]]) {
+    cyl(houseRoot, 0.05, 0.05, 0.72, 0x8a5f38, 3.0 + lx, 0, -1.9 + lz);
+  }
+  function chair(x, z, rotY) {
+    const g = new THREE.Group(); g.position.set(x, 0, z); g.rotation.y = rotY; houseRoot.add(g);
+    box(g, 0.46, 0.06, 0.46, 0xc99a63, 0, 0.44, 0);
+    box(g, 0.46, 0.5, 0.06, 0xc99a63, 0, 0.5, -0.2);
+    for (const [lx, lz] of [[-0.18, -0.18], [0.18, -0.18], [-0.18, 0.18], [0.18, 0.18]]) {
+      cyl(g, 0.025, 0.025, 0.44, 0x8a5f38, lx, 0, lz);
+    }
+  }
+  chair(3.0, -1.1, Math.PI);
+  chair(2.25, -2.5, Math.PI / 2);
+  chair(3.75, -2.5, -Math.PI / 2);
+
+  // ---------------------------------------------------------------- bedroom
+  box(houseRoot, 1.9, 0.3, 2.1, 0x8a6b4a, 3.0, 0, 2.5);        // bed frame
+  box(houseRoot, 1.8, 0.24, 2.0, 0xf2efe9, 3.0, 0.3, 2.5);     // mattress
+  box(houseRoot, 1.8, 0.14, 1.2, 0x5a7fb0, 3.0, 0.5, 2.0);     // blanket
+  box(houseRoot, 0.55, 0.14, 0.35, 0xffffff, 3.0, 0.54, 3.35); // pillow
+  box(houseRoot, 1.95, 0.9, 0.12, 0x6b4a2b, 3.0, 0, 3.6);      // headboard
+  box(houseRoot, 0.5, 0.5, 0.4, 0x8a6b4a, 1.75, 0, 3.35);      // nightstand
+  box(houseRoot, 0.44, 0.03, 0.34, 0x5a4527, 1.75, 0.3, 3.19);
+  cyl(houseRoot, 0.05, 0.07, 0.35, 0xf4e4b0, 1.75, 0.5, 3.35);  // lamp base
+  const shadeMat = new THREE.MeshStandardMaterial({ color: 0xffe9b0, emissive: 0xffdd88, emissiveIntensity: 0, roughness: 0.9, side: THREE.DoubleSide });
+  const shade = new THREE.Mesh(new THREE.ConeGeometry(0.16, 0.2, 16, 1, true), shadeMat);
+  shade.position.set(1.75, 0.95, 3.35); houseRoot.add(shade);
+  // wardrobe
+  box(houseRoot, 1.6, 2.2, 0.6, 0x7a5a3c, 4.6, 0, 1.2);
+  box(houseRoot, 0.03, 2.0, 0.62, 0x5a4028, 4.6, 0.1, 1.2, 0, { rough: 0.7 });
+  cyl(houseRoot, 0.02, 0.02, 0.25, 0xc0c6cc, 4.32, 1.0, 1.32, { metal: 0.6, rough: 0.3 });
+  cyl(houseRoot, 0.02, 0.02, 0.25, 0xc0c6cc, 4.88, 1.0, 1.32, { metal: 0.6, rough: 0.3 });
+  // rug
+  cyl(houseRoot, 0.95, 0.95, 0.02, 0x8a5a6a, 3.0, 0.015, 1.1, { seg: 28 });
+
+  // ---------------------------------------------------------------- living room
+  // sofa (facing -Z), at x=-2.8, z=2.6
+  const sofaColor = 0x4f6a8a;
+  box(houseRoot, 2.0, 0.4, 0.9, sofaColor, -2.8, 0, 2.6);
+  box(houseRoot, 2.0, 0.6, 0.22, sofaColor, -2.8, 0.4, 2.98);
+  box(houseRoot, 0.22, 0.55, 0.9, sofaColor, -3.9, 0, 2.6);
+  box(houseRoot, 0.22, 0.55, 0.9, sofaColor, -1.7, 0, 2.6);
+  box(houseRoot, 0.85, 0.14, 0.75, 0x7b93ad, -3.3, 0.4, 2.5);
+  box(houseRoot, 0.85, 0.14, 0.75, 0x7b93ad, -2.3, 0.4, 2.5);
+  // coffee table
+  box(houseRoot, 1.1, 0.08, 0.6, 0x8a6b4a, -2.8, 0.38, 1.2);
+  for (const [lx, lz] of [[-0.48, -0.24], [0.48, -0.24], [-0.48, 0.24], [0.48, 0.24]]) {
+    box(houseRoot, 0.06, 0.38, 0.06, 0x6b4a2b, -2.8 + lx, 0, 1.2 + lz);
+  }
+
+  // items on the coffee table: empty bottles + a glass + a magazine
+  const tableY = 0.46;
+  function glassMat(color, opacity) {
+    return new THREE.MeshStandardMaterial({
+      color, transparent: true, opacity, roughness: 0.08, metalness: 0.0,
+      side: THREE.DoubleSide, depthWrite: false
+    });
+  }
+  function bottle(x, z, color) {
+    const g = glassMat(color, 0.5);
+    const body = new THREE.Mesh(new THREE.CylinderGeometry(0.034, 0.04, 0.2, 16), g);
+    body.position.set(x, tableY + 0.1, z); houseRoot.add(body);
+    const shoulder = new THREE.Mesh(new THREE.CylinderGeometry(0.014, 0.034, 0.07, 16), g);
+    shoulder.position.set(x, tableY + 0.235, z); houseRoot.add(shoulder);
+    const neck = new THREE.Mesh(new THREE.CylinderGeometry(0.014, 0.014, 0.08, 12), g);
+    neck.position.set(x, tableY + 0.31, z); houseRoot.add(neck);
+    const cap = new THREE.Mesh(new THREE.CylinderGeometry(0.016, 0.016, 0.02, 12), mat(0xc0c6cc, 0.3, 0.6));
+    cap.position.set(x, tableY + 0.36, z); houseRoot.add(cap);
+  }
+  bottle(-3.10, 1.15, 0x2f8f56);   // green bottle
+  bottle(-2.92, 1.30, 0x9a6b2f);   // amber bottle
+  // drinking glass
+  const glassBody = new THREE.Mesh(new THREE.CylinderGeometry(0.042, 0.034, 0.12, 18, 1, true), glassMat(0xdff0ff, 0.32));
+  glassBody.position.set(-2.60, tableY + 0.06, 1.10); houseRoot.add(glassBody);
+  const glassBottom = new THREE.Mesh(new THREE.CylinderGeometry(0.034, 0.034, 0.012, 18), glassMat(0xdff0ff, 0.5));
+  glassBottom.position.set(-2.60, tableY + 0.006, 1.10); houseRoot.add(glassBottom);
+  // magazine
+  box(houseRoot, 0.2, 0.02, 0.28, 0xb0413f, -2.72, tableY, 1.40, 0.3);
+  box(houseRoot, 0.17, 0.005, 0.25, 0xe8e2d6, -2.72, tableY + 0.02, 1.40, 0.3);
+  // --- TV unit ---
+  function makeScreenTexture() {
+    const c = document.createElement('canvas');
+    c.width = 256; c.height = 144;
+    const g = c.getContext('2d');
+    const sky = g.createLinearGradient(0, 0, 0, 90);
+    sky.addColorStop(0, '#0a2a5e'); sky.addColorStop(1, '#3f8fd0');
+    g.fillStyle = sky; g.fillRect(0, 0, 256, 90);
+    g.fillStyle = '#ffd36b'; g.beginPath(); g.arc(200, 40, 16, 0, Math.PI * 2); g.fill();
+    g.fillStyle = '#2f6b4a'; g.beginPath();
+    g.moveTo(0, 110); g.quadraticCurveTo(80, 70, 160, 105);
+    g.quadraticCurveTo(210, 125, 256, 95); g.lineTo(256, 144); g.lineTo(0, 144); g.closePath(); g.fill();
+    g.fillStyle = '#1f4f36'; g.beginPath();
+    g.moveTo(0, 130); g.quadraticCurveTo(90, 105, 180, 128);
+    g.quadraticCurveTo(220, 138, 256, 120); g.lineTo(256, 144); g.lineTo(0, 144); g.closePath(); g.fill();
+    const t = new THREE.CanvasTexture(c);
+    t.colorSpace = THREE.SRGBColorSpace;
+    return t;
+  }
+
+  const tvX = -2.8, tvZ = -3.62;
+  // media console
+  box(houseRoot, 1.9, 0.42, 0.45, 0x3a2f26, tvX, 0.06, tvZ);
+  box(houseRoot, 1.95, 0.05, 0.5, 0x2a221c, tvX, 0.48, tvZ);
+  for (const lx of [-0.85, 0.85]) for (const lz of [-0.17, 0.17]) {
+    cyl(houseRoot, 0.03, 0.03, 0.06, 0x1c1712, tvX + lx, 0, tvZ + lz);
+  }
+  box(houseRoot, 0.42, 0.3, 0.015, 0x2c231c, tvX - 0.45, 0.12, tvZ + 0.23);
+  box(houseRoot, 0.42, 0.3, 0.015, 0x2c231c, tvX + 0.45, 0.12, tvZ + 0.23);
+  cyl(houseRoot, 0.008, 0.008, 0.1, 0xc0c6cc, tvX - 0.06, 0.24, tvZ + 0.245, { metal: 0.7, rough: 0.25 });
+  cyl(houseRoot, 0.008, 0.008, 0.1, 0xc0c6cc, tvX + 0.06, 0.24, tvZ + 0.245, { metal: 0.7, rough: 0.25 });
+  // media player + blu-ray box + remote on top
+  box(houseRoot, 0.5, 0.06, 0.3, 0x14181d, tvX + 0.5, 0.53, tvZ, 0, { metal: 0.3, rough: 0.35 });
+  box(houseRoot, 0.12, 0.02, 0.1, 0x2a2f34, tvX + 0.5, 0.59, tvZ);
+  box(houseRoot, 0.05, 0.02, 0.18, 0x1c2024, tvX - 0.72, 0.53, tvZ + 0.04, 0.2);
+  // TV base + neck
+  box(houseRoot, 0.6, 0.03, 0.28, 0x14181d, tvX, 0.53, tvZ);
+  cyl(houseRoot, 0.05, 0.06, 0.14, 0x14181d, tvX, 0.56, tvZ);
+  // bezel
+  box(houseRoot, 1.62, 0.94, 0.05, 0x0d1013, tvX, 0.70, tvZ, 0, { metal: 0.4, rough: 0.3 });
+  // screen (glowing)
+  const screenTex = makeScreenTexture();
+  const screenMat = new THREE.MeshStandardMaterial({
+    map: screenTex, emissive: 0xffffff, emissiveMap: screenTex, emissiveIntensity: 1.15,
+    roughness: 0.15, metalness: 0.0
+  });
+  const screen = new THREE.Mesh(new THREE.PlaneGeometry(1.5, 0.82), screenMat);
+  screen.position.set(tvX, 1.17, tvZ + 0.03);
+  houseRoot.add(screen);
+  // power LED
+  box(houseRoot, 0.03, 0.02, 0.01, 0xff3b30, tvX + 0.72, 0.72, tvZ + 0.03);
+  // bookshelf against west wall
+  const bs = new THREE.Group(); bs.position.set(-4.7, 0, 0); bs.rotation.y = Math.PI / 2; houseRoot.add(bs);
+  box(bs, 1.2, 2.0, 0.35, 0x6b4a2b, 0, 0, 0);
+  for (let i = 0; i < 4; i++) box(bs, 1.1, 0.04, 0.32, 0x8a6b4a, 0, 0.4 + i * 0.45, 0);
+  const bookColors = [0xb0413f, 0x3f6fb0, 0x4f9a54, 0xd0a13a, 0x8a4fb0, 0xc06a2a];
+  for (let i = 0; i < 12; i++) {
+    box(bs, 0.06, 0.28, 0.2, bookColors[i % bookColors.length], -0.5 + (i % 6) * 0.16, 0.42 + Math.floor(i / 6) * 0.9, 0.02);
+  }
+  // armchair
+  const ac = new THREE.Group(); ac.position.set(-0.2, 0, 1.4); ac.rotation.y = -Math.PI / 2; houseRoot.add(ac);
+  box(ac, 0.85, 0.4, 0.85, 0x6a7f6a, 0, 0, 0);
+  box(ac, 0.85, 0.6, 0.2, 0x6a7f6a, 0, 0.4, -0.32);
+  box(ac, 0.18, 0.5, 0.85, 0x6a7f6a, -0.34, 0, 0);
+  box(ac, 0.18, 0.5, 0.85, 0x6a7f6a, 0.34, 0, 0);
+  // rug
+  box(houseRoot, 2.8, 0.02, 2.0, 0x5d6b7a, -2.7, 0.015, 1.3);
+  // floor lamp
+  cyl(houseRoot, 0.03, 0.03, 1.6, 0x555b61, -0.5, 0, -2.4);
+  cyl(houseRoot, 0.18, 0.18, 0.05, 0x555b61, -0.5, 0, -2.4);
+  const shadeMat2 = shadeMat.clone();
+  const shade2 = new THREE.Mesh(new THREE.ConeGeometry(0.22, 0.3, 16, 1, true), shadeMat2);
+  shade2.position.set(-0.5, 1.7, -2.4); houseRoot.add(shade2);
+
+  // ---------------------------------------------------------------- lamps (night)
+  const kitchenLamp = new THREE.PointLight(0xffe0a0, 0, 7, 2); kitchenLamp.position.set(3.0, 2.35, -2.0); world.add(kitchenLamp);
+  const kitchenBulb = cyl(houseRoot, 0.08, 0.12, 0.14, 0xfff0c0, 3.0, 2.35, -2.0);
+  const bedroomLamp = new THREE.PointLight(0xffd9a0, 0, 5, 2); bedroomLamp.position.set(1.75, 1.0, 3.35); world.add(bedroomLamp);
+  const livingLamp = new THREE.PointLight(0xffe4b0, 0, 7, 2); livingLamp.position.set(-0.5, 1.55, -2.4); world.add(livingLamp);
+  const hemi = new THREE.HemisphereLight(0xbfd9ff, 0x2a2f38, 1.0);
+  world.add(hemi);
+
+  // ---------------------------------------------------------------- sky / sun / moon / stars / ground
+  const sun = new THREE.DirectionalLight(0xfff4e0, 2.0);
+  sun.castShadow = true;
+  sun.shadow.mapSize.set(2048, 2048);
+  sun.shadow.camera.left = -14; sun.shadow.camera.right = 14;
+  sun.shadow.camera.top = 14; sun.shadow.camera.bottom = -14;
+  sun.shadow.camera.near = 0.5; sun.shadow.camera.far = 60;
+  world.add(sun);
+  world.add(sun.target);
+
+  const sunBall = new THREE.Mesh(new THREE.SphereGeometry(0.7, 16, 12),
+    new THREE.MeshBasicMaterial({ color: 0xffdf9a }));
+  world.add(sunBall);
+  const moonBall = new THREE.Mesh(new THREE.SphereGeometry(0.45, 16, 12),
+    new THREE.MeshBasicMaterial({ color: 0xdfe8f2 }));
+  world.add(moonBall);
+
+  const starGeo = new THREE.BufferGeometry();
+  const starPos = [];
+  for (let i = 0; i < 500; i++) {
+    const v = new THREE.Vector3().randomDirection().multiplyScalar(90);
+    if (v.y < 0) v.y = -v.y;
+    starPos.push(v.x, v.y, v.z);
+  }
+  starGeo.setAttribute('position', new THREE.Float32BufferAttribute(starPos, 3));
+  const starMat = new THREE.PointsMaterial({ color: 0xffffff, size: 0.35, transparent: true, opacity: 0 });
+  world.add(new THREE.Points(starGeo, starMat));
+
+  const ground = new THREE.Mesh(new THREE.PlaneGeometry(120, 120),
+    new THREE.MeshStandardMaterial({ color: 0x33502f, roughness: 1.0 }));
+  ground.rotation.x = -Math.PI / 2;
+  ground.receiveShadow = true;
+  world.add(ground);
+
+  const pedestal = new THREE.Mesh(new THREE.CylinderGeometry(2.6, 2.8, 0.18, 40),
+    new THREE.MeshStandardMaterial({ color: 0x1b2733, roughness: 0.7, metalness: 0.2 }));
+  pedestal.position.set(0, 0.9, -1.5);
+  pedestal.visible = false;
+  world.add(pedestal);
+
+  // ---------------------------------------------------------------- day / night
+  const SKY = [
+    [0, 0x05080f], [4.5, 0x0a1020], [6, 0x2a3550], [7, 0xff8a4a],
+    [9, 0x8fb8e0], [12, 0x9cc4ea], [16, 0x8fb8e0], [18, 0xff7a3a],
+    [19.5, 0x24304a], [21, 0x0a1020], [24, 0x05080f]
+  ];
+  const cA = new THREE.Color(), cB = new THREE.Color();
+  function skyColorAt(t, out) {
+    for (let i = 0; i < SKY.length - 1; i++) {
+      const [h1, c1] = SKY[i], [h2, c2] = SKY[i + 1];
+      if (t >= h1 && t <= h2) {
+        cA.setHex(c1); cB.setHex(c2);
+        return out.copy(cA).lerp(cB, (t - h1) / (h2 - h1));
+      }
+    }
+    return out.setHex(0x05080f);
+  }
+
+  let timeOfDay = 10;
+  let autoTime = true;
+  const HOURS_PER_SEC = 0.35;
+  const sunDir = new THREE.Vector3();
+  const skyCol = new THREE.Color();
+  const warm = new THREE.Color(0xff8a4a);
+  const white = new THREE.Color(0xfff6e8);
+
+  function updateDayNight() {
+    const ang = (timeOfDay - 6) / 12 * Math.PI;   // 6h..18h -> 0..PI
+    const elev = Math.sin(ang);
+    const day = THREE.MathUtils.clamp(elev, 0, 1);
+    const light = THREE.MathUtils.smoothstep(elev, -0.12, 0.28);
+
+    sunDir.set(Math.cos(ang) * 30, elev * 30, 12).normalize();
+    sun.position.copy(sunDir).multiplyScalar(28);
+    sun.target.position.set(0, 0, 0);
+    sun.intensity = light * 2.6;
+    sun.color.copy(warm).lerp(white, day);
+
+    sunBall.position.copy(sun.position).multiplyScalar(0.92);
+    sunBall.visible = elev > -0.15;
+
+    const moonAng = ang + Math.PI;
+    moonBall.position.set(Math.cos(moonAng) * 26, Math.sin(moonAng) * 26, -10);
+    moonBall.visible = Math.sin(moonAng) > -0.1;
+
+    hemi.intensity = 0.25 + light * 0.95;
+    hemi.color.copy(warm).lerp(new THREE.Color(0xbfd9ff), day);
+    hemi.groundColor.setHex(0x2a2f38);
+
+    skyColorAt(timeOfDay, skyCol);
+    scene.background = skyCol;
+
+    const night = 1 - light;
+    kitchenLamp.intensity = night * 2.6;
+    bedroomLamp.intensity = night * 1.8;
+    livingLamp.intensity = night * 2.2;
+    shadeMat.emissiveIntensity = night * 1.2;
+    shadeMat2.emissiveIntensity = night * 1.2;
+    kitchenBulb.material.emissive = new THREE.Color(0xfff0c0);
+    kitchenBulb.material.emissiveIntensity = night * 1.4;
+
+    starMat.opacity = night;
+
+    const h = Math.floor(timeOfDay) % 24;
+    const m = Math.floor((timeOfDay % 1) * 60);
+    clockEl.textContent = String(h).padStart(2, '0') + ':' + String(m).padStart(2, '0');
+    if (!dragging) timeSlider.value = timeOfDay.toFixed(1);
+  }
+
+  // ---------------------------------------------------------------- player / locomotion
+  const player = { x: 0, z: 7.0, yaw: 0 };
+  const SPEED = 1.9, TURN = 1.7, RADIUS = 0.32;
+  const moveVec = new THREE.Vector3();
+  const fwd = new THREE.Vector3();
+  const right = new THREE.Vector3();
+
+  function collides(x, z) {
+    for (const w of wallBoxes) {
+      if (x > w.minX - RADIUS && x < w.maxX + RADIUS &&
+          z > w.minZ - RADIUS && z < w.maxZ + RADIUS) return true;
+    }
+    return false;
+  }
+
+  function step(dt, turn, fwdAmount, strafe) {
+    player.yaw -= turn * TURN * dt;
+    fwd.set(-Math.sin(player.yaw), 0, -Math.cos(player.yaw));
+    right.set(-fwd.z, 0, fwd.x);
+    moveVec.set(0, 0, 0).addScaledVector(fwd, fwdAmount).addScaledVector(right, strafe);
+    const len = Math.hypot(moveVec.x, moveVec.z);
+    if (len < 0.001) return;
+    const vx = moveVec.x / len * SPEED * dt;
+    const vz = moveVec.z / len * SPEED * dt;
+    if (!overview) {
+      if (!collides(player.x + vx, player.z)) player.x += vx;
+      if (!collides(player.x, player.z + vz)) player.z += vz;
+    } else {
+      player.x += vx; player.z += vz;
+    }
+  }
+
+  const worldM = new THREE.Matrix4();
+  const rotM = new THREE.Matrix4();
+  const trM = new THREE.Matrix4();
+  function applyWorld() {
+    if (renderer.xr.isPresenting) {
+      rotM.makeRotationY(-player.yaw);
+      trM.makeTranslation(-player.x, 0, -player.z);
+      world.matrix.multiplyMatrices(rotM, trM);
+      world.matrixWorldNeedsUpdate = true;
+    } else {
+      world.matrix.identity();
+      world.matrixWorldNeedsUpdate = true;
+      camera.position.set(player.x, 1.65, player.z);
+      camera.rotation.set(0, player.yaw, 0);
+    }
+  }
+
+  // ---------------------------------------------------------------- overview mode
+  let overview = false;
+  function setMode(ov) {
+    overview = ov;
+    houseRoot.scale.setScalar(overview ? 0.25 : 1);
+    // Overview = true top-down: rotate the model so the open top (floor plan) faces the viewer.
+    houseRoot.rotation.x = overview ? Math.PI / 2 : 0;
+    houseRoot.position.set(0, overview ? 1.35 : 0, overview ? -1.9 : 0);
+    ground.visible = !overview;
+    pedestal.visible = false;
+    player.x = 0; player.z = overview ? 0 : 7.0; player.yaw = 0;
+    btnMode.textContent = overview ? 'Вид: обзор' : 'Вид: прогулка';
+  }
+
+  // ---------------------------------------------------------------- XR input
+  const stick = (gp) => {
+    if (!gp) return { x: 0, y: 0 };
+    const a = gp.axes || [];
+    const cands = [];
+    if (a.length >= 4) cands.push([a[2] || 0, a[3] || 0]);
+    cands.push([a[0] || 0, a[1] || 0]);
+    for (const [x, y] of cands) if (Math.hypot(x, y) > 0.18) return { x, y };
+    return { x: 0, y: 0 };
+  };
+  const btn = (gp, i) => !!(gp && gp.buttons && gp.buttons[i] && gp.buttons[i].pressed);
+  const prev = { a: false, b: false, x: false, y: false };
+
+  function readXR() {
+    const session = renderer.xr.getSession();
+    if (!session) return;
+    let l = { x: 0, y: 0 }, r = { x: 0, y: 0 };
+    let gpL = null, gpR = null;
+    for (const src of session.inputSources) {
+      if (src.handedness === 'left') { gpL = src.gamepad; l = stick(gpL); }
+      else if (src.handedness === 'right') { gpR = src.gamepad; r = stick(gpR); }
+    }
+    const nowA = btn(gpR, 4), nowB = btn(gpR, 5), nowX = btn(gpL, 4), nowY = btn(gpL, 5);
+    if (nowA && !prev.a) setMode(!overview);
+    if (nowB && !prev.b) { autoTime = !autoTime; btnPlay.textContent = autoTime ? 'Время: авто' : 'Время: пауза'; }
+    if (nowY && !prev.y) { player.x = 0; player.z = overview ? 0 : 7; player.yaw = 0; }
+    prev.a = nowA; prev.b = nowB; prev.x = nowX; prev.y = nowY;
+    return { l, r };
+  }
+
+  // ---------------------------------------------------------------- DOM UI
+  const clockEl = document.getElementById('clock');
+  const btnMode = document.getElementById('btnMode');
+  const btnPlay = document.getElementById('btnPlay');
+  const timeSlider = document.getElementById('timeSlider');
+  let dragging = false;
+  btnMode.onclick = () => setMode(!overview);
+  btnPlay.onclick = () => { autoTime = !autoTime; btnPlay.textContent = autoTime ? 'Время: авто' : 'Время: пауза'; };
+  document.getElementById('btnReset').onclick = () => { player.x = 0; player.z = overview ? 0 : 7; player.yaw = 0; };
+  timeSlider.addEventListener('input', () => { timeOfDay = parseFloat(timeSlider.value); autoTime = false; btnPlay.textContent = 'Время: пауза'; });
+  timeSlider.addEventListener('pointerdown', () => dragging = true);
+  timeSlider.addEventListener('pointerup', () => dragging = false);
+
+  setMode(false);
+  updateDayNight();
+
+  // ---------------------------------------------------------------- loop
+  const clock = new THREE.Clock();
+  function tick() {
+    const dt = Math.min(clock.getDelta(), 0.05);
+    if (autoTime) timeOfDay = (timeOfDay + dt * HOURS_PER_SEC) % 24;
+    updateDayNight();
+
+    const input = readXR();
+    if (input) step(dt, input.r.x, -input.l.y, input.l.x);
+    applyWorld();
+
+    renderer.render(scene, camera);
+  }
+  renderer.setAnimationLoop(tick);
+
+  window.addEventListener('resize', () => {
+    camera.aspect = window.innerWidth / window.innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(window.innerWidth, window.innerHeight);
+  });
+  </script>
+</body>
+</html>

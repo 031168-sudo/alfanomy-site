@@ -62,4 +62,8 @@
   /* телефон — с новой строки, под «Успешно работаем» */
   .site-contact{text-align:left !important}
   .site-phone{display:block}
+  /* логотип на полном цвете: без полупрозрачной белой полосы сверху */
+  .site-top-bar,.site-header{background-color:transparent !important}
+  /* меньше расстояние от красной полосы до текста */
+  .site-content{padding-top:12px !important}
 }

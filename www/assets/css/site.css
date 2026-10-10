@@ -52,3 +52,14 @@
 .lb-prev{left:4px;top:50%;transform:translateY(-50%)}
 .lb-next{right:4px;top:50%;transform:translateY(-50%)}
 @media(max-width:600px){.lb-img{max-width:100%;max-height:80%}.lb-prev,.lb-next{top:auto;bottom:10px;transform:none}}
+
+/* Мобильная версия (телефон) */
+@media(max-width:767px){
+  /* логотип — в верхней полосе, справа от кнопки меню */
+  .site-header__inner{height:90px}
+  #c-website-logo{position:absolute;left:104px;top:-63px;width:auto}
+  #c-website-logo img{height:50px !important;width:auto !important;max-width:none}
+  /* телефон — с новой строки, под «Успешно работаем» */
+  .site-contact{text-align:left !important}
+  .site-phone{display:block}
+}

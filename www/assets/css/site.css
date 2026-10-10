@@ -20,7 +20,7 @@
 }
 .local-carousel-layer .lc-slide.active{opacity:1}
 @media(max-width:767px){
-  .local-carousel-layer{height:350px}
+  .local-carousel-layer{height:335px}
 }
 
 /* Mobile-only carousel framing and title adjustments */
@@ -66,4 +66,11 @@
   .site-top-bar,.site-header{background-color:transparent !important}
   /* меньше расстояние от красной полосы до текста */
   .site-content{padding-top:12px !important}
+  /* надпись «ОХРАНА и мониторинг транспорта» — на красной полосе, с отступом слева */
+  #c-m-11205282123{position:relative !important;top:0 !important;padding-left:0 !important;padding-top:0 !important;padding-bottom:0 !important}
+  #c-m-header-11205282123{font-size:12px !important;line-height:24px !important;color:#fff !important;position:relative !important;top:-2px !important}
+  #c-m-11205282123 a{color:#fff !important;display:block;line-height:24px !important}
+  #c-website-title{height:24px !important;overflow:visible}
+  #c-m-11205282123{height:24px !important;margin:0 !important}
+  #c-m-11205282123 > *{margin:0 !important;padding:0 !important}
 }
